@@ -1,0 +1,153 @@
+#cloud-config
+# pi-tailscale-firstboot fragment.
+# firstboot.py merges this into the SD card's user-data. Do not copy it by hand
+# unless you know your user-data has no write_files/runcmd keys of its own.
+#
+# @TS_UP_FLAGS@ is replaced by firstboot.py (e.g. "--ssh").
+
+write_files:
+  - path: /usr/local/bin/ptf-setup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Waits for internet, installs Tailscale, joins the tailnet, deletes the key.
+      # Retries forever (and on every boot) until it succeeds.
+      LOG=/boot/firmware/ptf-log.txt
+      KEY=/boot/firmware/tailscale-authkey
+      log() { echo "$(date '+%F %T') setup: $*" >> "$LOG"; sync; }
+
+      [ -s "$KEY" ] || { log "no auth key on the card - nothing to do"; exit 0; }
+
+      log "waiting for internet (HTTPS to pkgs.tailscale.com)"
+      until curl -fsS -m 10 -o /dev/null https://pkgs.tailscale.com/stable/; do sleep 15; done
+      log "internet OK"
+
+      until command -v tailscale >/dev/null 2>&1; do
+        curl -fsSL https://tailscale.com/install.sh | sh >> /var/log/ptf-setup.log 2>&1 \
+          || { log "Tailscale install failed, retrying in 30s"; sleep 30; }
+      done
+      log "Tailscale installed: $(tailscale version | head -1)"
+      systemctl enable --now tailscaled
+
+      HN=$(hostname)
+      until tailscale up @TS_UP_FLAGS@ --hostname="$HN" --auth-key="$(tr -d '[:space:]' < "$KEY")" >> /var/log/ptf-setup.log 2>&1; do
+        log "tailscale up failed, retrying in 30s (is the auth key valid and unused?)"
+        sleep 30
+      done
+
+      rm -f "$KEY"; sync
+      log "SUCCESS - joined tailnet as $HN ($(tailscale ip -4 2>/dev/null | head -1))"
+      /bin/sh /usr/local/bin/ptf-report.sh
+      systemctl disable ptf-setup.service >/dev/null 2>&1
+      exit 0
+
+  - path: /usr/local/bin/ptf-heartbeat.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Writes one status line every 30s to the boot partition, which any
+      # computer can read. Stops by itself once Tailscale is up (or after 2h).
+      LOG=/boot/firmware/ptf-log.txt
+      echo "$(date '+%F %T') booted (cloud-init instance $(cat /run/cloud-init/.instance-id 2>/dev/null))" >> "$LOG"; sync
+      i=0
+      while true; do
+        i=$((i+1))
+        ip=$(hostname -I 2>/dev/null | sed 's/ *$//')
+        web=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204)
+        tls=$(curl -s -o /dev/null -m 8 -w '%{http_code}' https://pkgs.tailscale.com/stable/)
+        ts=$(tailscale ip -4 2>/dev/null | head -1)
+        seen=$(nmcli -t -f SSID dev wifi list 2>/dev/null | grep -v '^$' | sort -u | tr '\n' '|')
+        echo "$(date '+%F %T') up=$(cut -d. -f1 /proc/uptime)s power=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2) ip=[$ip] web=$web https=$tls tailscale=[${ts:-none}] wifi_seen=[$seen]" >> "$LOG"
+        sync
+        case $i in 4|12|40) /bin/sh /usr/local/bin/ptf-report.sh ;; esac
+        if [ -n "$ts" ] && [ ! -s /boot/firmware/tailscale-authkey ]; then
+          echo "$(date '+%F %T') Tailscale is up - heartbeat stopping" >> "$LOG"; sync
+          systemctl disable ptf-heartbeat.service >/dev/null 2>&1
+          exit 0
+        fi
+        if [ "$i" -ge 240 ]; then
+          echo "$(date '+%F %T') heartbeat stopping after 2h (it restarts on next boot)" >> "$LOG"; sync
+          exit 0
+        fi
+        sleep 30
+      done
+
+  - path: /usr/local/bin/ptf-report.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Full network/setup snapshot written to /boot/firmware/ptf-report.txt.
+      {
+        echo "===== $(date)   up $(cut -d. -f1 /proc/uptime)s"
+        echo "--- power (throttled=0x0 means OK)"; vcgencmd get_throttled
+        echo "--- radios"; rfkill list
+        echo "--- addresses"; ip -br addr
+        echo "--- routes"; ip route
+        echo "--- devices"; nmcli dev
+        echo "--- saved connections"; nmcli -f NAME,TYPE,DEVICE,AUTOCONNECT con show
+        echo "--- wifi networks the Pi can see"; nmcli -f SSID,CHAN,SECURITY,SIGNAL dev wifi list --rescan yes
+        echo "--- internet"
+        echo "http  (204 = open internet): $(curl -s -o /dev/null -m 5 -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204)"
+        echo "https (200 = reachable):      $(curl -s -o /dev/null -m 8 -w '%{http_code}' https://pkgs.tailscale.com/stable/)"
+        echo "dns: $(getent hosts tailscale.com | head -1)"
+        echo "--- cloud-init"; cloud-init status --long
+        echo "--- tailscale"; tailscale status 2>&1 | head -5
+        echo "--- setup log (last 30)"; tail -n 30 /var/log/ptf-setup.log 2>/dev/null
+        echo "--- cloud-init output (last 30)"; tail -n 30 /var/log/cloud-init-output.log
+        echo "--- NetworkManager (last 40)"; journalctl -b -u NetworkManager --no-pager | tail -n 40
+        echo "--- kernel wifi/power messages"; dmesg | grep -iE 'brcm|wlan|cfg80211|under-voltage' | tail -n 20
+      } > /boot/firmware/ptf-report.txt 2>&1
+      sync
+
+  - path: /usr/local/sbin/ptf-cleanup
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Removes pi-tailscale-firstboot helpers once the Pi is on your tailnet.
+      #   sudo ptf-cleanup                       remove services, scripts and logs
+      #   sudo ptf-cleanup --disable-cloud-init  also stop cloud-init re-running the card's config
+      set -e
+      [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+      systemctl disable --now ptf-heartbeat.service ptf-setup.service 2>/dev/null || true
+      rm -f /etc/systemd/system/ptf-heartbeat.service /etc/systemd/system/ptf-setup.service
+      rm -f /usr/local/bin/ptf-setup.sh /usr/local/bin/ptf-heartbeat.sh /usr/local/bin/ptf-report.sh
+      rm -f /boot/firmware/ptf-log.txt /boot/firmware/ptf-report.txt /boot/firmware/ptf-errors.txt
+      rm -f /boot/firmware/tailscale-authkey /var/log/ptf-setup.log
+      systemctl daemon-reload
+      if [ "${1:-}" = "--disable-cloud-init" ]; then
+        touch /etc/cloud/cloud-init.disabled
+        echo "cloud-init disabled"
+      fi
+      rm -f /usr/local/sbin/ptf-cleanup
+      echo "pi-tailscale-firstboot helpers removed. Tailscale itself stays installed and enabled."
+
+  - path: /etc/systemd/system/ptf-setup.service
+    content: |
+      [Unit]
+      Description=pi-tailscale-firstboot: install Tailscale and join tailnet
+      After=network.target
+      ConditionPathExists=/boot/firmware/tailscale-authkey
+      [Service]
+      ExecStart=/bin/sh /usr/local/bin/ptf-setup.sh
+      Restart=on-failure
+      RestartSec=30
+      StandardError=append:/boot/firmware/ptf-errors.txt
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/ptf-heartbeat.service
+    content: |
+      [Unit]
+      Description=pi-tailscale-firstboot: status log on the boot partition
+      After=local-fs.target
+      [Service]
+      ExecStart=/bin/sh /usr/local/bin/ptf-heartbeat.sh
+      Restart=on-failure
+      RestartSec=10
+      StandardError=append:/boot/firmware/ptf-errors.txt
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, ptf-heartbeat.service, ptf-setup.service ]
